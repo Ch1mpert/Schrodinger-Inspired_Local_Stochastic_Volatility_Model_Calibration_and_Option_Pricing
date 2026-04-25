@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
-autocallable_pricer_lamperti.py — CTMC-Lamperti-LSV Autocallable Pricer (ρ≠0)
-================================================================================
 Prices autocallable structured products using the calibrated CTMC-Lamperti-LSV
 model with ρ≠0 coupling.
 
-Key design principles:
+When given a list of maturities (and optionally multiple obs frequencies),
+this version prices ALL contracts in a SINGLE forward pass of the joint
+density, rather than re-propagating from t=0 for each contract.
+
+The Fokker-Planck propagator exp(A_k·dt) at each substep is
+model-dependent, not contract-dependent. All contracts' slices can propagate
+under the same generator in one batched call per substep. Contracts differ
+only in bookkeeping at their own observation dates.
+
+This file is a complete, standalone pricer. Use `price_family` to price
+multiple contracts at once, or `price_autocallable` to price a single
+contract (unchanged from the original behavior).
+
   1. Uses calibrated pillar densities as checkpoints (no re-evolution from t=0)
   2. Bucket-aware propagation matching calibration substep grid exactly
   3. Batch propagation: builds generator once per substep, applies to all slices
   4. Barrier application in z-space via state-dependent X→z mapping
+  5. Amortized family pricing: one forward pass for N contracts
 
-State space is (v_ℓ, X_j) with X = g(z) - ρv/ξ (Lamperti transform).
-Uses coupled generator (FP + CTMC combined) — no operator splitting.
-Converts between X-space (propagation) and z-space (barriers/payoffs)
-via z = g⁻¹(X + ρv/ξ).
-
-Usage:
-  python3 autocallable_pricer_lamperti_fixed.py \
-    --lsv_result coupled_v2/lamperti_lsv_model.npz \
+Usage (amortized family pricing):
+  python3 CTMC_Lamperti_LSV_Autocallable_Pricer.py \
+    --lsv_result data/lamperti_lsv_model.npz \
     --forward_curve data/forward_curve_interpolated_daily.csv \
     --discount_curve data/discount_curve_grid.csv
 """
 from __future__ import annotations
 import argparse, time, csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
@@ -38,6 +44,19 @@ try:
     _GPU = cp.cuda.runtime.getDeviceCount() > 0
 except Exception:
     _GPU = False; cp = None; cp_sparse = None
+
+# Module-level precision toggle for uniformization on GPU.
+# When True, the Taylor expansion runs in float32, halving memory bandwidth
+# at the cost of ~7-decimal precision. Can be toggled from main() via the
+# --f32 / --f64 CLI flags. Defaults to False (float64) for correctness;
+# set True for timing experiments or when thesis tolerance allows the
+# resulting ~6-9 bps pricing drift.
+_USE_F32 = False
+
+def set_f32(enabled: bool):
+    """Globally enable/disable float32 uniformization on GPU."""
+    global _USE_F32
+    _USE_F32 = bool(enabled)
 
 # ══════════════════════════════════════════════════════════════
 # DATA CLASSES
@@ -293,23 +312,142 @@ def unif_cpu(A, v, t, tol=1e-13):
         w = r
     return w
 
-def unif_gpu(A, v, t, tol=1e-13):
+def unif_gpu(A, v, t, tol=1e-13, use_f32=None):
+    """GPU single-vector uniformization. Optional float32 mode.
+
+    use_f32=None (default): honors module-level _USE_F32 flag.
+    use_f32=False: float64 arithmetic throughout. Matches the original
+    pricer's precision.
+
+    use_f32=True: casts the sparse matrix and vector to float32 for the
+    Taylor expansion. Halves bandwidth cost at the price of ~7-decimal
+    precision. **Can accumulate ~70 ppm mass drift over a warm-start
+    propagation and ~6-9 bps pricing drift over a full horizon at
+    N=1.44M**. Use for timing experiments or quick iteration.
+    """
+    if use_f32 is None:
+        use_f32 = _USE_F32
     if not _GPU: return unif_cpu(A, v, t, tol)
     diag = np.array(A.diagonal()); lam = float(np.max(-diag))
     if lam < 1e-30: return v.copy()
     P_cpu = A.copy(); P_cpu.setdiag(P_cpu.diagonal() + lam); P_cpu = P_cpu * (1.0 / lam)
-    P_g = cp_sparse.csr_matrix((cp.asarray(P_cpu.data), cp.asarray(P_cpu.indices),
-                                 cp.asarray(P_cpu.indptr)), shape=P_cpu.shape)
+
+    dtype = cp.float32 if use_f32 else cp.float64
+
+    P_g = cp_sparse.csr_matrix(
+        (cp.asarray(P_cpu.data, dtype=dtype),
+         cp.asarray(P_cpu.indices),
+         cp.asarray(P_cpu.indptr)),
+        shape=P_cpu.shape,
+    )
     tgt = 30.0; ns = max(1, int(np.ceil(lam * t / tgt))); dt_ = t / ns
     ld = lam * dt_; K = int(ld + 6 * np.sqrt(max(ld, 1))) + 5; K = max(K, 10)
-    w = cp.asarray(v); enld = np.exp(-ld)
+    w = cp.asarray(v, dtype=dtype); enld = dtype(np.exp(-ld))
     for _ in range(ns):
         r = w * enld; term = w.copy(); c = enld
         for k in range(1, K + 1):
-            term = P_g.dot(term); c *= ld / k; r = r + c * term
-            if k > 5 and c < tol: break
+            term = P_g.dot(term); c = c * dtype(ld / k); r = r + c * term
+            if k > 5 and float(c) < tol: break
         w = r
-    return cp.asnumpy(w)
+    return cp.asnumpy(w).astype(np.float64)
+
+# ── TRUE BATCHED UNIFORMIZATION (SpMM across all slices) ──
+#
+# unif_cpu/unif_gpu above operate on a single vector v. The original
+# _propagate_batch wrapped them in a Python loop which is NOT batched —
+# each slice paid the full uniformization-setup cost and the Taylor
+# expansion did not share the sparse-matrix traversal across slices.
+#
+# unif_cpu_batch / unif_gpu_batch below take V of shape (N, M) and apply
+# exp(A·t) to every column simultaneously. The dominant kernel is
+# P @ term with term of shape (N, M), i.e., sparse-matrix-dense-matrix
+# product (SpMM). This is what GPU libraries (cuSPARSE via cupyx) batch
+# efficiently: one kernel launch processes all M columns.
+#
+# Per-substep cost drops from O(M × slice_cost) to O(slice_cost + M × SpMM).
+# For M up to ~100 on N=1.44M the SpMM overhead is small compared to
+# fixed kernel-launch cost, so effective per-slice marginal cost is near-zero.
+
+def unif_cpu_batch(A, V, t, tol=1e-13):
+    """CPU version of batched uniformization. V: (N, M) dense matrix.
+    Returns (N, M) propagated matrix."""
+    if V.ndim == 1:
+        return unif_cpu(A, V, t, tol).reshape(-1, 1)
+    diag = np.array(A.diagonal()); lam = float(np.max(-diag))
+    if lam < 1e-30: return V.copy()
+    P = A.copy(); P.setdiag(P.diagonal() + lam); P = P * (1.0 / lam)
+    tgt = 30.0; ns = max(1, int(np.ceil(lam * t / tgt))); dt_ = t / ns
+    ld = lam * dt_; K = int(ld + 6 * np.sqrt(max(ld, 1))) + 5; K = max(K, 10)
+    W = V.copy()
+    for _ in range(ns):
+        R = W * np.exp(-ld); term = W.copy(); c = np.exp(-ld)
+        for k in range(1, K + 1):
+            term = P.dot(term); c *= ld / k; R += c * term
+            if c * np.max(np.abs(term)) < tol * (np.max(np.abs(R)) + 1e-30): break
+        W = R
+    return W
+
+def unif_gpu_batch(A, V, t, tol=1e-13, use_f32=None):
+    """GPU batched uniformization via SpMM.
+
+    V: (N, M) dense matrix of column vectors.
+    Returns: (N, M) propagated matrix.
+
+    Key kernel: P_g.dot(term) where term is (N, M) → cuSPARSE SpMM,
+    which processes all M columns in a single kernel launch.
+
+    use_f32=None (default): honors module-level _USE_F32 flag.
+    use_f32=False: float64 arithmetic. Matches the original pricer's
+    precision.
+
+    use_f32=True: float32 arithmetic. Halves bandwidth cost but can
+    accumulate ~6-9 bps of pricing drift over a 2Y horizon at N=1.44M.
+    Enable via main()'s --f32 flag for timing experiments.
+
+    Performance note: at N=1.44M, each SpMM call is bandwidth-bound
+    (~5-15ms in f64, ~3-8ms in f32 on a 4070 SUPER). The Taylor
+    expansion makes 30-150 such calls per substep.
+    """
+    if use_f32 is None:
+        use_f32 = _USE_F32
+    if not _GPU:
+        return unif_cpu_batch(A, V, t, tol)
+    if V.ndim == 1:
+        return unif_gpu(A, V, t, tol, use_f32=use_f32).reshape(-1, 1)
+    diag = np.array(A.diagonal()); lam = float(np.max(-diag))
+    if lam < 1e-30: return V.copy()
+    P_cpu = A.copy(); P_cpu.setdiag(P_cpu.diagonal() + lam); P_cpu = P_cpu * (1.0 / lam)
+
+    dtype = cp.float32 if use_f32 else cp.float64
+
+    # Cast the sparse data to the target dtype (indices/indptr stay int32).
+    P_data_g = cp.asarray(P_cpu.data, dtype=dtype)
+    P_idx_g = cp.asarray(P_cpu.indices)
+    P_ptr_g = cp.asarray(P_cpu.indptr)
+    P_g = cp_sparse.csr_matrix((P_data_g, P_idx_g, P_ptr_g), shape=P_cpu.shape)
+
+    tgt = 30.0; ns = max(1, int(np.ceil(lam * t / tgt))); dt_ = t / ns
+    ld = lam * dt_; K = int(ld + 6 * np.sqrt(max(ld, 1))) + 5; K = max(K, 10)
+
+    W = cp.asarray(V, dtype=dtype)
+    enld = dtype(np.exp(-ld))
+
+    for _ in range(ns):
+        R = W * enld
+        term = W.copy()
+        c = enld
+        for k in range(1, K + 1):
+            term = P_g.dot(term)             # SpMM in the chosen precision
+            c = c * dtype(ld / k)
+            R = R + c * term
+            if k > 5 and float(c) < tol:
+                break
+        W = R
+
+    # Cast back to float64 for the rest of the pricer
+    return cp.asnumpy(W).astype(np.float64)
+
+_propagate_batched_kernel = unif_gpu_batch if _GPU else unif_cpu_batch
 
 _propagate_vec = unif_gpu if _GPU else unif_cpu
 
@@ -511,8 +649,20 @@ class LampertiPropagator:
             # Build generator (same for all slices)
             A_fwd = self._build_drift_and_generator(L_prev, L_new, g_prev, g_new, dt_sub)
             
-            # Propagate all slices with same generator
-            result = [np.maximum(_propagate_vec(A_fwd, p, dt_sub), 0) for p in result]
+            # TRUE BATCHED PROPAGATION: stack all slice densities as columns
+            # of a dense matrix V, apply exp(A_fwd * dt_sub) to all columns
+            # simultaneously via a single SpMM-based uniformization call.
+            # This shares: (a) the λ/P/ns/K setup, (b) the sparse matrix
+            # traversal across all M slices. Expected speedup vs per-slice
+            # loop: roughly the number of active slices.
+            if len(result) == 1:
+                # Single slice: no batching win, keep the original single-vector path
+                result = [np.maximum(_propagate_vec(A_fwd, result[0], dt_sub), 0)]
+            else:
+                V = np.column_stack(result)                              # (N, M)
+                V_next = _propagate_batched_kernel(A_fwd, V, dt_sub)     # (N, M)
+                np.maximum(V_next, 0, out=V_next)
+                result = [V_next[:, i].copy() for i in range(V_next.shape[1])]
             
             g_prev = g_new.copy()
             L_prev = L_new.copy()
@@ -600,13 +750,32 @@ class LampertiPropagator:
                 return p_list_new, k, L_new, g_new
         return p_list, None, None, None
 
-    def propagate_batch(self, p_list, t_start, t_end):
+    def propagate_batch(self, p_list, t_start, t_end, apply_internal_remap=False):
         """Propagate a list of density vectors from t_start to t_end.
         
         Bucket-aware: splits at pillar boundaries and uses native substep
         resolution within each bucket, matching the calibration exactly.
-        Applies the calibrator's pillar-entry boundary remap at t_start
-        if it coincides with a pillar time (k >= 1).
+
+        Pillar-entry boundary remap behavior:
+          - Always applied if t_start coincides with a pillar (matches the
+            sequential pricer's get_density_at_time + propagate flow when
+            starting from a stored pillar density).
+          - For internal pillar crossings during the propagation:
+              * apply_internal_remap=False (default, matches sequential
+                pricer): no remap fires at internal crossings. The density
+                propagates continuously through bucket boundaries with the
+                bucket-k+1 generator picking up where bucket-k left off.
+                This is what the original sequential pricer's
+                propagate_batch does.
+              * apply_internal_remap=True: the remap fires at every pillar
+                crossing during the propagation. This matches what the
+                CALIBRATION does in its forward induction: at each pillar
+                entry, recompute leverage via Gyöngy on the current density
+                and remap. Use this only for full-mass densities that
+                represent calibration-equivalent state (e.g., the shared
+                base in the grouped pricer's multi-group orchestration).
+                Applying it to post-observation contract slices would give
+                Gyöngy projections on partial densities, which is wrong.
         
         For times beyond the last pillar, uses the last bucket's end-of-pillar
         leverage with uniform substeps (frozen leverage extrapolation).
@@ -639,6 +808,24 @@ class LampertiPropagator:
                 result = self._propagate_beyond_last_pillar(result, t_cur, t_end)
                 t_cur = t_end
                 break
+            
+            # ── INTERNAL PILLAR-CROSSING REMAP (opt-in) ──
+            # When apply_internal_remap=True, fire the pillar-entry boundary
+            # remap whenever t_cur lands on a pillar boundary mid-flight.
+            # This matches what the calibration does at every bucket entry.
+            # Use only for full-mass densities (e.g., shared base in grouped
+            # pricer). For post-observation contract slices, leave this off
+            # to match the sequential pricer's behavior.
+            if apply_internal_remap and remap_bucket is None:
+                for k_pillar in range(1, self.n_buckets):
+                    if abs(t_cur - self.pillar_T[k_pillar - 1]) < 1e-8:
+                        result, rb, Lp, gp = \
+                            self._apply_boundary_remap_if_needed(result, t_cur)
+                        if rb is not None:
+                            remap_bucket = rb
+                            L_post = Lp
+                            g_post = gp
+                        break
             
             k = self._find_bucket_for_propagation(t_cur)
             
@@ -721,7 +908,13 @@ class LampertiPropagator:
         
         result = [p.copy() for p in p_list]
         for _ in range(n_sub):
-            result = [np.maximum(_propagate_vec(A_fwd, p, dt_sub), 0) for p in result]
+            if len(result) == 1:
+                result = [np.maximum(_propagate_vec(A_fwd, result[0], dt_sub), 0)]
+            else:
+                V = np.column_stack(result)
+                V_next = _propagate_batched_kernel(A_fwd, V, dt_sub)
+                np.maximum(V_next, 0, out=V_next)
+                result = [V_next[:, i].copy() for i in range(V_next.shape[1])]
         
         return result
     
@@ -1113,6 +1306,937 @@ def plot_multi(curves, path=None, title="Price difference"):
     return fig
 
 # ══════════════════════════════════════════════════════════════
+# AMORTIZED MULTI-CONTRACT PRICING  (single forward walk)
+# ══════════════════════════════════════════════════════════════
+# Price a family of autocallable contracts in ONE forward walk from t=0
+# to max maturity.
+#
+# Data model:
+#   V: (N, M) dense matrix. Each column is a density slice. M grows and
+#      shrinks over the walk.
+#   column_owner: list of length M. column_owner[c] = (contract_id, ki_flag,
+#      memory_count) identifies which contract+state a column belongs to.
+#   A special owner value None means the column is SHARED — it represents
+#      the base density for all contracts that haven't observed yet.
+#
+# Algorithm:
+#   1. V = [Dirac at t=0], column_owner = [None]  (shared by everyone)
+#   2. Walk observation events in time order. Between consecutive events
+#      propagate V via one batched exp(A·dt) call per substep (using
+#      propagate_batch which already does per-substep batching internally).
+#   3. At each observation event:
+#        - For each contract C observing at that time:
+#            - Find all columns C owns (including the shared None column
+#              if C has never observed before).
+#            - Apply KI / AC / coupon / terminal logic, splitting columns
+#              as needed. New columns are added; retired columns removed.
+#            - Mark C's new columns with appropriate owner tuples. The
+#              shared None column STAYS if any contract still hasn't
+#              observed; it propagates alongside contract-specific columns.
+#   4. After final event, each contract has accumulated its price.
+#
+# No get_density_at_time checkpoints: every contract starts from the
+# Dirac-propagated-forward base. Means quarterly 0.25Y prices differ
+# slightly from old reference (pricer↔calibration drift of ~5-10 bps).
+
+@dataclass
+class ContractState:
+    """Per-contract bookkeeping during the amortized forward walk."""
+    contract_id: int
+    spec: AutocallableSpec
+    observation_dates: np.ndarray
+    K: int
+    # Aggregated results:
+    price: float = 0.0
+    autocall_probabilities: np.ndarray = field(default=None)
+    stop_probabilities: np.ndarray = field(default=None)
+    coupon_contributions: np.ndarray = field(default=None)
+    autocall_contributions: np.ndarray = field(default=None)
+    terminal_par_contribution: float = 0.0
+    terminal_put_contribution: float = 0.0
+    retired: bool = False
+    has_observed: bool = False  # True once the contract has had its first obs
+
+    def __post_init__(self):
+        if self.autocall_probabilities is None:
+            self.autocall_probabilities = np.zeros(self.K)
+        if self.stop_probabilities is None:
+            self.stop_probabilities = np.zeros(self.K)
+        if self.coupon_contributions is None:
+            self.coupon_contributions = np.zeros(self.K)
+        if self.autocall_contributions is None:
+            self.autocall_contributions = np.zeros(self.K)
+
+
+def _build_initial_density(model: LampertiModel) -> np.ndarray:
+    """Construct the joint Dirac initial condition at t=0.
+
+    Same convention as get_density_at_time's t<first-pillar branch: for
+    each variance state ℓ, place mass pi0[ℓ]/dX at the X-grid point
+    corresponding to z=0 (S=S0), shifted by -ρ·v_ℓ/ξ per the Lamperti
+    transform. Linearly interpolate between the two nearest grid points.
+    """
+    M = model.n_states
+    Nx = len(model.X_grid)
+    dX = model.dX
+    p0 = np.zeros(M * Nx)
+    for ell in range(M):
+        X0 = -model.rho * model.v_states[ell] / model.xi
+        fx = (X0 - model.X_grid[0]) / dX
+        il = int(fx); ir = il + 1
+        if 0 <= il < Nx and 0 <= ir < Nx:
+            w = fx - il
+            p0[ell * Nx + il] = model.pi0[ell] * (1 - w) / dX
+            p0[ell * Nx + ir] = model.pi0[ell] * w / dX
+        elif 0 <= il < Nx:
+            p0[ell * Nx + il] = model.pi0[ell] / dX
+    return p0
+
+
+def _apply_contract_observation(
+    cs: ContractState,
+    k_obs: int,
+    t_obs: float,
+    V_cols: Dict[Tuple[int, int], np.ndarray],
+    z_all: np.ndarray,
+    F: float,
+    D: float,
+    propagator: LampertiPropagator,
+    M: int, Nx: int, N: int, dX: float, S0: float,
+) -> Dict[Tuple[int, int], np.ndarray]:
+    """Apply KI / AC / coupon / terminal logic for one contract at one
+    of its observations.
+
+    V_cols: dict mapping (ki_flag, memory_count) -> density column (length N).
+            This is the contract's view of the current columns it owns.
+
+    Returns a new V_cols dict (post-observation columns this contract
+    still owns). Side-effect: accumulates contract's price and per-obs
+    contributions into cs.
+    """
+    spec = cs.spec
+    fin = (k_obs == cs.K - 1)
+    can = (k_obs >= spec.no_call_periods) and not fin
+
+    ab = spec.ac_barrier - spec.ac_step_down * k_obs
+    za = np.log(max(ab * S0 / F, 1e-12))
+    zc = np.log(max(spec.coupon_barrier * S0 / F, 1e-12))
+    zk = np.log(max(spec.ki_barrier * S0 / F, 1e-12))
+
+    # ── KI barrier check ──
+    us: Dict[Tuple[int, int], np.ndarray] = {}
+    for (b, m), u in V_cols.items():
+        if b == 0:
+            u_survived, u_ki_flat, ki_mass = apply_z_split(
+                u, z_all, zk, M, Nx, dX, above=True)
+            if ki_mass > 1e-12:
+                k2 = (1, m)
+                us[k2] = us.get(k2, np.zeros(N)) + u_ki_flat
+            if propagator.mass(u_survived) > 1e-12:
+                k2 = (0, m)
+                us[k2] = us.get(k2, np.zeros(N)) + u_survived
+        else:
+            k2 = (b, m)
+            us[k2] = us.get(k2, np.zeros(N)) + u.copy()
+
+    # ── Autocall + coupon + terminal ──
+    post: Dict[Tuple[int, int], np.ndarray] = {}
+    for (b, m), u in us.items():
+        if can:
+            u_survived, u_ac_flat, ac_mass = apply_z_split(
+                u, z_all, za, M, Nx, dX, above=False)
+            if ac_mass > 1e-12:
+                nc = (m + 1) if spec.memory else 1
+                cv = D * spec.notional * (1 + nc * spec.coupon_rate) * ac_mass
+                cs.price += cv
+                cs.autocall_probabilities[k_obs] += ac_mass
+                cs.autocall_contributions[k_obs] += cv
+            u = u_survived
+
+        if fin:
+            u_above_cpn, _, _ = apply_z_split(u, z_all, zc, M, Nx, dX, above=True)
+            cpn_mass = propagator.mass(u_above_cpn)
+            if cpn_mass > 0:
+                nc = (m + 1) if spec.memory else 1
+                cv = D * spec.notional * nc * spec.coupon_rate * cpn_mass
+                cs.coupon_contributions[k_obs] += cv
+                cs.price += cv
+
+            tm = propagator.mass(u)
+            if b == 0:
+                pv = D * spec.notional * tm
+                cs.terminal_par_contribution += pv
+                cs.price += pv
+            else:
+                pv = D * spec.notional * compute_put_payoff(
+                    u, z_all, F, spec.put_strike, S0, M, Nx, dX)
+                cs.terminal_put_contribution += pv
+                cs.price += pv
+            continue
+
+        u_above_cpn, u_below_cpn, _ = apply_z_split(
+            u, z_all, zc, M, Nx, dX, above=True)
+        ma = propagator.mass(u_above_cpn)
+        mb = propagator.mass(u_below_cpn)
+
+        if ma > 1e-12:
+            nc = (m + 1) if spec.memory else 1
+            cv = D * spec.notional * nc * spec.coupon_rate * ma
+            cs.coupon_contributions[k_obs] += cv
+            cs.price += cv
+            kr = (b, 0)
+            post[kr] = post.get(kr, np.zeros(N)) + u_above_cpn
+        if mb > 1e-12:
+            ki = (b, m + 1 if spec.memory else 0)
+            post[ki] = post.get(ki, np.zeros(N)) + u_below_cpn
+
+    if fin:
+        return {}   # all mass converted to payoffs
+    # Drop negligible columns
+    return {k: v for k, v in post.items() if propagator.mass(v) > 1e-12}
+
+
+def price_family(
+    model: LampertiModel,
+    contracts: List[AutocallableSpec],
+    fwd, disc,
+    propagator: Optional[LampertiPropagator] = None,
+    verbose: bool = True,
+) -> List[PricingResult]:
+    """Price a family of autocallable contracts in ONE forward walk.
+
+    Design:
+      - Single V matrix. Columns are density slices (each length N).
+      - Before any observation: V has one column, the shared Dirac-
+        propagated base. ALL contracts use this column until they first
+        observe.
+      - At each observation event: contracts observing there take their
+        columns (including the shared base if still sharing), apply
+        their barrier logic, and spawn new contract-specific columns.
+        The shared base column remains in V if any contract still hasn't
+        observed.
+      - Between observations: V is batch-propagated by propagate_batch,
+        which builds the generator ONCE per substep and applies it to
+        every column via one SpMM call (see unif_gpu_batch).
+
+    All contracts experience the same generator sequence. Each column
+    propagates under the SAME exp(A·dt) per substep; columns diverge
+    only through the contract-specific barrier cuts at observations.
+    """
+    t0_wall = time.time()
+    S0 = model.S0; dX = model.dX
+    M = model.n_states; Nx = len(model.X_grid); N = M * Nx
+
+    if propagator is None:
+        propagator = LampertiPropagator(model)
+
+    n_contracts = len(contracts)
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"AMORTIZED FAMILY PRICER (CTMC-Lamperti-LSV, ρ={model.rho:.4f})")
+        print(f"{'='*70}")
+        print(f"  S0={S0:.2f}  Contracts={n_contracts}")
+        print(f"  Max maturity: {max(c.maturity_years for c in contracts):.4f}y")
+        print(f"  Model: M={M} Nx={Nx} N={N}")
+        print(f"  GPU precision: {'float32' if _USE_F32 else 'float64'}")
+
+    # ── Build contract states ──
+    states: List[ContractState] = []
+    for i, spec in enumerate(contracts):
+        obs = generate_observation_dates(spec.maturity_years, spec.obs_freq)
+        states.append(ContractState(
+            contract_id=i, spec=spec, observation_dates=obs, K=len(obs),
+        ))
+
+    # ── Build sorted union of observation events ──
+    tol = 1e-8
+    all_obs: List[Tuple[float, int, int]] = []
+    for cs in states:
+        for k_obs, t_obs in enumerate(cs.observation_dates):
+            all_obs.append((float(t_obs), cs.contract_id, k_obs))
+    all_obs.sort(key=lambda x: x[0])
+    events: List[Tuple[float, List[Tuple[int, int]]]] = []
+    for t_obs, ci, ki in all_obs:
+        if events and abs(t_obs - events[-1][0]) < tol:
+            events[-1][1].append((ci, ki))
+        else:
+            events.append((t_obs, [(ci, ki)]))
+
+    if verbose:
+        print(f"  Events (unique obs dates): {len(events)}")
+        print(f"  Total (contract, obs) pairs: {len(all_obs)}")
+
+    # ── Initialize V with single shared Dirac column ──
+    # OWNED_BY_ALL is a sentinel contract_id for the shared base column.
+    OWNED_BY_ALL = -1
+    # column_map: dict keyed by (owner_id, ki_flag, memory_count) -> list of
+    # column index into V. We store arrays as list-of-arrays; when
+    # propagating, we stack them into a (N, M) matrix.
+    # A single contract may own multiple columns with the same key... no,
+    # actually each (owner_id, ki_flag, mem) combination is unique because
+    # observation logic merges same-key slices.
+    #
+    # Owner columns:
+    #   OWNED_BY_ALL: the shared base column, one entry only with key
+    #                  (OWNED_BY_ALL, 0, 0).
+    #   contract_id i: columns keyed (i, b, m) where (b,m) is the slice state.
+    #
+    # We represent column_map as a plain dict: (owner, b, m) -> density vector
+    column_map: Dict[Tuple[int, int, int], np.ndarray] = {
+        (OWNED_BY_ALL, 0, 0): _build_initial_density(model)
+    }
+
+    if verbose:
+        p0 = column_map[(OWNED_BY_ALL, 0, 0)]
+        print(f"  Initial Dirac mass: {propagator.mass(p0):.6f}")
+
+    t_cur = 0.0
+
+    # ── Walk events ──
+    for ev_idx, (t_event, contract_obs_list) in enumerate(events):
+        # Propagate ALL columns from t_cur to t_event in one batched call.
+        if t_event > t_cur + 1e-12:
+            keys = list(column_map.keys())
+            cols = [column_map[k] for k in keys]
+
+            if verbose:
+                print(f"  [prop] t={t_cur:.4f}->{t_event:.4f}  "
+                      f"columns={len(cols)}  "
+                      f"(elapsed {time.time()-t0_wall:.1f}s)",
+                      end="", flush=True)
+
+            t0 = time.time()
+            propagated = propagator.propagate_batch(cols, t_cur, t_event)
+            dt_prop = time.time() - t0
+
+            if verbose:
+                print(f"  done in {dt_prop:.2f}s", flush=True)
+
+            for i, k in enumerate(keys):
+                column_map[k] = propagated[i]
+            t_cur = t_event
+
+        # Apply observations at t_event
+        g_now = propagator.get_g_at_time(t_event)
+        z_all = propagator.z_at_Xv(g_now)
+        F = float(fwd(t_event))
+        D = float(disc(t_event))
+
+        # Who's still sharing the base?
+        any_not_yet_observed = any(
+            (not cs.has_observed) and (not cs.retired) for cs in states
+        )
+
+        # Build the subset of columns each observing contract sees.
+        # If the contract hasn't observed yet, it sees the shared base
+        # column as its own (0, 0) slice. After it processes its
+        # observation, its columns become contract-specific.
+        for cid, k_obs in contract_obs_list:
+            cs = states[cid]
+            if cs.retired:
+                continue
+
+            # Gather the contract's current slices.
+            # If first observation: it sees a copy of the shared base.
+            # Else: it owns columns already.
+            if not cs.has_observed:
+                # Take a copy of the shared base — we must not mutate
+                # the shared column because other not-yet-observed
+                # contracts still need it.
+                base = column_map[(OWNED_BY_ALL, 0, 0)]
+                V_cols = {(0, 0): base.copy()}
+            else:
+                V_cols = {
+                    (b, m): column_map[(cid, b, m)]
+                    for (o, b, m) in list(column_map.keys())
+                    if o == cid
+                }
+                # Remove old contract columns from the map (will re-add
+                # post-observation).
+                for (b, m) in V_cols:
+                    del column_map[(cid, b, m)]
+
+            # Apply observation logic
+            post = _apply_contract_observation(
+                cs, k_obs, t_event, V_cols, z_all, F, D, propagator,
+                M, Nx, N, dX, S0,
+            )
+
+            cs.has_observed = True
+            if k_obs == cs.K - 1:
+                cs.retired = True
+
+            # Re-insert contract's post-observation columns
+            for (b, m), u in post.items():
+                column_map[(cid, b, m)] = u
+
+        # After all contracts at this event are processed, check whether
+        # the shared base is still needed. If all contracts have now
+        # observed, drop the shared base column — nobody needs it.
+        still_need_base = any(
+            (not cs.has_observed) and (not cs.retired) for cs in states
+        )
+        if not still_need_base and (OWNED_BY_ALL, 0, 0) in column_map:
+            del column_map[(OWNED_BY_ALL, 0, 0)]
+            if verbose:
+                print(f"  [base dropped] at t={t_event:.4f}")
+
+        if verbose:
+            n_cols = len(column_map)
+            print(f"  After obs t={t_event:.4f}: V has {n_cols} columns  "
+                  f"(contracts retired: {sum(1 for c in states if c.retired)}/{n_contracts})")
+
+    # ── Build PricingResult for each contract ──
+    results: List[PricingResult] = []
+    for cs in states:
+        ap = cs.autocall_probabilities
+        sp = np.zeros(cs.K)
+        sp[:-1] = ap[:-1]
+        t_final = float(cs.observation_dates[-1])
+        D_final = float(disc(t_final))
+        if D_final > 0 and cs.spec.notional > 0:
+            surv_mass = (cs.terminal_par_contribution
+                         + cs.terminal_put_contribution) / (D_final * cs.spec.notional)
+        else:
+            surv_mass = 0.0
+        sp[-1] = surv_mass
+        ts = float(np.sum(sp))
+        ee = float(np.dot(cs.observation_dates, sp) / ts) if ts > 1e-15 else 0.0
+
+        results.append(PricingResult(
+            price=cs.price,
+            notional=cs.spec.notional,
+            price_pct=cs.price / cs.spec.notional * 100,
+            autocall_probabilities=ap,
+            stop_probabilities=sp,
+            coupon_contributions=cs.coupon_contributions,
+            autocall_contributions=cs.autocall_contributions,
+            terminal_par_contribution=cs.terminal_par_contribution,
+            terminal_put_contribution=cs.terminal_put_contribution,
+            survival_probability=surv_mass,
+            ki_probability=0.0,
+            observation_dates=cs.observation_dates,
+            memory_enabled=cs.spec.memory,
+            expected_expiry_years=ee,
+        ))
+
+    if verbose:
+        total_wall = time.time() - t0_wall
+        print(f"\n  Total wall time: {total_wall:.2f}s for {n_contracts} contracts")
+        if n_contracts > 0:
+            print(f"  Avg per contract: {total_wall/n_contracts:.2f}s")
+
+    return results
+
+
+def price_ts_amortized(model, base, mats, cpns, fwd, disc, verbose=True):
+    """Price all (maturity, coupon) pairs in one amortized pass."""
+    pairs = sorted(zip(mats, cpns))
+    contracts = [
+        AutocallableSpec(**{**base.__dict__,
+                            "maturity_years": T, "coupon_rate": c})
+        for (T, c) in pairs
+    ]
+    results = price_family(model, contracts, fwd, disc, verbose=verbose)
+    pts = []
+    for (T, c), r, spec in zip(pairs, results, contracts):
+        pd = r.price / spec.notional - 1.0
+        pts.append(TermStructurePoint(
+            T, c, r.price, r.price_pct, pd, 1e4 * pd,
+            r.survival_probability, r.terminal_par_contribution,
+            r.terminal_put_contribution, r.expected_expiry_years, spec.obs_freq,
+        ))
+    return pts
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GROUPED PRICER — shares slice trajectory across contracts with
+# identical barrier structure. Differs from price_family only in how
+# slices are tracked: contracts sharing a (ki_barrier, ac_barrier,
+# ac_step_down, memory, coupon_barrier, no_call_periods, obs_freq) key
+# propagate ONE slice family together, paying per-contract payoffs at
+# observation events.
+# ═══════════════════════════════════════════════════════════════════════
+
+def _group_key(spec: AutocallableSpec) -> tuple:
+    """Return a hashable key capturing all barrier-structure attributes
+    that determine slice evolution. Contracts sharing this key can share
+    slice trajectories; they differ only in maturity and coupon_rate,
+    which affect payoff accumulation but not slice dynamics."""
+    return (
+        normalize_obs_freq(spec.obs_freq),
+        float(spec.ki_barrier),
+        float(spec.ac_barrier),
+        float(spec.ac_step_down),
+        float(spec.coupon_barrier),
+        float(spec.put_strike),
+        bool(spec.memory),
+        int(spec.no_call_periods),
+    )
+
+
+def _apply_group_observation(
+    group_states: List[ContractState],  # contracts in this group, some may be retired
+    group_V_cols: Dict[Tuple[int, int], np.ndarray],  # (ki_flag, memory_count) -> density
+    k_obs: int,                                        # obs index WITHIN the full group schedule
+    t_obs: float,
+    spec_template: AutocallableSpec,                   # shared barrier attributes
+    z_all: np.ndarray,
+    F: float, D: float,
+    propagator: LampertiPropagator,
+    M: int, Nx: int, N: int, dX: float, S0: float,
+) -> Dict[Tuple[int, int], np.ndarray]:
+    """Apply one observation for a GROUP of contracts sharing barrier structure.
+
+    This is a direct port of the sequential pricer's observation-body logic,
+    generalized to track per-contract payoff accumulation when a single slice
+    trajectory serves multiple contracts.
+
+    Structure (mirrors sequential pricer's for-loop body):
+      1. KI barrier split on b=0 slices → b=1 slices for newly-KI'd mass
+      2. For each slice (b, m):
+         a. If any contract in the group is continuing past this obs AND
+            k_obs >= no_call_periods: AC split
+              - Non-final contracts accumulate their AC payoff from ac_mass
+              - `u` becomes `u_survived` (post-AC)
+         b. For contracts whose FINAL observation is here:
+              - Read terminal par/put/coupon-at-maturity from `u` (post-AC for
+                group-case since non-finals did AC)
+              - Note: in the sequential pricer, a contract's own final obs has
+                can=False, so `u` at the fin-branch is PRE-AC for that single
+                contract. In the group case with mixed finality, we use `u`
+                as passed at the time the finals' terminal logic runs.
+                Since final contracts don't autocall, the AC mass shouldn't
+                count toward their terminal. We handle this by splitting:
+                terminal-par for finals uses PRE-AC mass; AC for non-finals
+                uses the AC'd mass.
+         c. If any contract is continuing: coupon-at-obs split
+              - Non-final contracts accumulate observation coupon from ma
+              - Post-obs slice: u_above_cpn at (b, 0); u_below_cpn at (b, m+1)
+
+    The key numerical constraint: the slice `u` that continues (as post-obs
+    `(b, 0)` / `(b, m+1)`) must equal what the sequential pricer would
+    produce for a non-final contract at this obs. So AC + coupon splits
+    both apply to the slice, regardless of which contracts are in the group.
+    """
+    # Determine which contracts in this group are observing at this t_obs
+    contracts_active: List[Tuple[ContractState, int, bool]] = []
+    for cs in group_states:
+        if cs.retired:
+            continue
+        my_obs = cs.observation_dates
+        my_k = None
+        for kk, t_my in enumerate(my_obs):
+            if abs(t_my - t_obs) < 1e-8:
+                my_k = kk
+                break
+        if my_k is None:
+            continue
+        is_final_for_me = (my_k == cs.K - 1)
+        contracts_active.append((cs, my_k, is_final_for_me))
+
+    if not contracts_active:
+        return group_V_cols
+
+    # Pull shared barrier levels from the template
+    ki_barrier = spec_template.ki_barrier
+    ac_barrier = spec_template.ac_barrier - spec_template.ac_step_down * k_obs
+    coupon_barrier = spec_template.coupon_barrier
+    memory = spec_template.memory
+    no_call = spec_template.no_call_periods
+    put_strike = spec_template.put_strike
+
+    zk = np.log(max(ki_barrier * S0 / F, 1e-12))
+    za = np.log(max(ac_barrier * S0 / F, 1e-12))
+    zc = np.log(max(coupon_barrier * S0 / F, 1e-12))
+
+    # Does AC apply at this obs for any continuing contract?
+    any_continuing = any(not fin for (_, _, fin) in contracts_active)
+    can_group = (k_obs >= no_call) and any_continuing
+
+    # ── KI barrier split (mirrors sequential lines 946-960) ──
+    us: Dict[Tuple[int, int], np.ndarray] = {}
+    for (b, m), u in group_V_cols.items():
+        if b == 0:
+            u_survived, u_ki_flat, ki_mass = apply_z_split(
+                u, z_all, zk, M, Nx, dX, above=True)
+            if ki_mass > 1e-12:
+                k2 = (1, m)
+                us[k2] = us.get(k2, np.zeros(N)) + u_ki_flat
+            if propagator.mass(u_survived) > 1e-12:
+                k2 = (0, m)
+                us[k2] = us.get(k2, np.zeros(N)) + u_survived
+        else:
+            k2 = (b, m)
+            us[k2] = us.get(k2, np.zeros(N)) + u.copy()
+
+    # ── Per-slice processing (mirrors sequential lines 963-1002) ──
+    # For each slice (b, m), we do:
+    #   1. AC split if can_group (produces ac_mass credited to non-finals,
+    #      u becomes u_survived which is post-AC)
+    #   2. Terminal payoff for finals in this group, using the u AT THE
+    #      SEQUENTIAL-PRICER'S STATE for a final contract. In the
+    #      sequential pricer, a contract's final obs has can=False, so the
+    #      u at the fin-branch is pre-AC. To replicate this, finals here
+    #      should take their terminal from the PRE-AC mass.
+    #   3. Coupon-at-obs split if any_continuing; post slices go to `post`
+    post: Dict[Tuple[int, int], np.ndarray] = {}
+    finals_here = [t for t in contracts_active if t[2]]
+
+    for (b, m), u in us.items():
+        # Save pre-AC mass for finals (in sequential, finals see u pre-AC)
+        u_pre_ac = u  # reference, not copy — we don't modify u in place
+
+        # ── AC split (if group has continuing contracts and k_obs >= no_call) ──
+        if can_group:
+            u_survived, u_ac_flat, ac_mass = apply_z_split(
+                u, z_all, za, M, Nx, dX, above=False)
+            if ac_mass > 1e-12:
+                nc = (m + 1) if memory else 1
+                # Credit AC to every non-final contract in contracts_active
+                for (cs, my_k, is_final) in contracts_active:
+                    if is_final:
+                        continue
+                    cv = D * cs.spec.notional * (1 + nc * cs.spec.coupon_rate) * ac_mass
+                    cs.price += cv
+                    cs.autocall_probabilities[my_k] += ac_mass
+                    cs.autocall_contributions[my_k] += cv
+            u = u_survived
+
+        # ── Terminal payoff for final contracts (using pre-AC mass) ──
+        # Mirrors sequential's fin branch where u is pre-AC (can=False when fin).
+        if finals_here:
+            u_above_cpn_pre, _, _ = apply_z_split(
+                u_pre_ac, z_all, zc, M, Nx, dX, above=True)
+            cpn_mass_pre = propagator.mass(u_above_cpn_pre)
+            tm_pre = propagator.mass(u_pre_ac)
+            nc_fin = (m + 1) if memory else 1
+            for (cs, my_k, _) in finals_here:
+                if cpn_mass_pre > 0:
+                    cv = D * cs.spec.notional * nc_fin * cs.spec.coupon_rate * cpn_mass_pre
+                    cs.coupon_contributions[my_k] += cv
+                    cs.price += cv
+                if b == 0:
+                    pv = D * cs.spec.notional * tm_pre
+                    cs.terminal_par_contribution += pv
+                    cs.price += pv
+                else:
+                    pv = D * cs.spec.notional * compute_put_payoff(
+                        u_pre_ac, z_all, F, put_strike, S0, M, Nx, dX)
+                    cs.terminal_put_contribution += pv
+                    cs.price += pv
+
+        # ── Coupon-at-obs split for continuing contracts ──
+        if any_continuing:
+            u_above_cpn, u_below_cpn, _ = apply_z_split(
+                u, z_all, zc, M, Nx, dX, above=True)
+            ma = propagator.mass(u_above_cpn)
+            mb = propagator.mass(u_below_cpn)
+
+            if ma > 1e-12:
+                nc = (m + 1) if memory else 1
+                for (cs, my_k, is_final) in contracts_active:
+                    if is_final:
+                        continue
+                    cv = D * cs.spec.notional * nc * cs.spec.coupon_rate * ma
+                    cs.coupon_contributions[my_k] += cv
+                    cs.price += cv
+                kr = (b, 0)
+                post[kr] = post.get(kr, np.zeros(N)) + u_above_cpn
+            if mb > 1e-12:
+                ki = (b, m + 1 if memory else 0)
+                post[ki] = post.get(ki, np.zeros(N)) + u_below_cpn
+
+    # Retire contracts whose final obs is here
+    for (cs, _, is_final) in contracts_active:
+        if is_final:
+            cs.retired = True
+        cs.has_observed = True
+
+    # Drop negligible columns
+    return {k: v for k, v in post.items() if propagator.mass(v) > 1e-12}
+def price_family_grouped(
+    model: LampertiModel,
+    contracts: List[AutocallableSpec],
+    fwd, disc,
+    propagator: Optional[LampertiPropagator] = None,
+    verbose: bool = True,
+) -> List[PricingResult]:
+    """Price a family of autocallable contracts, sharing slice trajectories
+    across contracts with identical barrier structure.
+
+    Contracts are grouped by `_group_key(spec)`. Each group propagates ONE
+    slice family, computing per-contract payoffs at observation events.
+    Number of slice columns scales with (number of GROUPS × slices-per-group),
+    not (number of contracts × slices-per-contract).
+
+    For a 16-contract set with 2 obs_freq values and all other barriers
+    identical, the slice count drops from ~28 to ~4-6. Expected speedup on
+    large propagation steps: roughly the ratio of slice counts.
+    """
+    t0_wall = time.time()
+    S0 = model.S0; dX = model.dX
+    M = model.n_states; Nx = len(model.X_grid); N = M * Nx
+
+    if propagator is None:
+        propagator = LampertiPropagator(model)
+
+    n_contracts = len(contracts)
+
+    # ── Build contract states ──
+    states: List[ContractState] = []
+    for i, spec in enumerate(contracts):
+        obs = generate_observation_dates(spec.maturity_years, spec.obs_freq)
+        states.append(ContractState(
+            contract_id=i, spec=spec, observation_dates=obs, K=len(obs),
+        ))
+
+    # ── Group contracts by barrier-structure key ──
+    groups: Dict[tuple, List[ContractState]] = {}
+    for cs in states:
+        key = _group_key(cs.spec)
+        groups.setdefault(key, []).append(cs)
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"GROUPED FAMILY PRICER (CTMC-Lamperti-LSV, ρ={model.rho:.4f})")
+        print(f"{'='*70}")
+        print(f"  S0={S0:.2f}  Contracts={n_contracts}  Groups={len(groups)}")
+        for i, (key, members) in enumerate(groups.items()):
+            print(f"    Group {i}: {len(members)} contracts, obs_freq={key[0]}, "
+                  f"KI={key[1]}, AC={key[2]}")
+        print(f"  Max maturity: {max(c.maturity_years for c in contracts):.4f}y")
+        print(f"  Model: M={M} Nx={Nx} N={N}")
+        print(f"  GPU precision: {'float32' if _USE_F32 else 'float64'}")
+
+    # ── Build per-group event schedules ──
+    # For each group, build the full ordered obs date list, which is the
+    # union of all contracts' obs dates in the group. Since they share
+    # obs_freq, this equals the LONGEST contract's obs schedule.
+    group_schedules: Dict[tuple, np.ndarray] = {}
+    for key, members in groups.items():
+        max_mat_spec = max(members, key=lambda c: c.spec.maturity_years).spec
+        sched = generate_observation_dates(
+            max_mat_spec.maturity_years, max_mat_spec.obs_freq)
+        group_schedules[key] = sched
+
+    # ── Build global event timeline: all unique obs times across groups ──
+    tol = 1e-8
+    all_obs: List[Tuple[float, tuple, int]] = []  # (t, group_key, k_obs_in_group)
+    for key, sched in group_schedules.items():
+        for k_obs, t_obs in enumerate(sched):
+            all_obs.append((float(t_obs), key, k_obs))
+    all_obs.sort(key=lambda x: x[0])
+
+    # Coalesce events by time: at each unique time, record list of (group_key, k_obs)
+    events: List[Tuple[float, List[Tuple[tuple, int]]]] = []
+    for t_obs, key, k_obs in all_obs:
+        if events and abs(t_obs - events[-1][0]) < tol:
+            events[-1][1].append((key, k_obs))
+        else:
+            events.append((t_obs, [(key, k_obs)]))
+
+    if verbose:
+        print(f"  Events (unique obs dates): {len(events)}")
+        print(f"  Initial Dirac mass: 1.000000")
+
+    # ── Initialize per-group V_cols. All groups start sharing the Dirac base. ──
+    # Once a group's first obs arrives, the shared base is split into that
+    # group's own slice family. But as long as a group hasn't observed yet,
+    # it can use the shared base column. To simplify bookkeeping: we maintain
+    # one shared base column PLUS per-group slices. At each event, groups
+    # that haven't observed yet take a copy of the shared base.
+    SHARED_BASE = "__shared_base__"
+    # "column" here is a pair (key, (b, m)) where key is either SHARED_BASE
+    # or a group_key. All columns are length-N density vectors.
+    V_map: Dict[Tuple[object, Tuple[int, int]], np.ndarray] = {
+        (SHARED_BASE, (0, 0)): _build_initial_density(model)
+    }
+    # Per-group tracking of whether they've taken their own slice trajectory yet
+    group_observed: Dict[tuple, bool] = {key: False for key in groups}
+
+    # ── Process each event ──
+    t_prev = 0.0
+    for event_idx, (t_event, group_obs_list) in enumerate(events):
+        # Propagate all V columns from t_prev to t_event
+        if t_event > t_prev + 1e-12:
+            # CRITICAL: propagate shared_base SEPARATELY from contract slices.
+            # The propagator's pillar-entry remap uses p_list[0] as the density
+            # on which to recompute the post-remap leverage. Each "independent"
+            # density should be remapped against its own density, not against
+            # another density that happened to be batched with it.
+            #
+            # In particular: the shared_base represents the full-mass calibrated
+            # density trajectory. Contract slices represent post-observation
+            # partial densities. If both are batched together, the remap uses
+            # shared_base's full density for everyone — including contract
+            # slices that in the sequential pricer would remap against their
+            # own partial density. The sequential pricer is the validated
+            # reference; grouping must match its behavior.
+            #
+            # Solution: propagate shared_base in its own call, then contract
+            # slices in a separate call. Each call's remap uses the appropriate
+            # p_list[0].
+            shared_keys = [k for k in V_map if k[0] == SHARED_BASE]
+            other_keys = [k for k in V_map if k[0] != SHARED_BASE]
+            if verbose:
+                total_cols = len(shared_keys) + len(other_keys)
+                print(f"  [prop] t={t_prev:.4f}->{t_event:.4f}  "
+                      f"columns={total_cols}  (elapsed {time.time()-t0_wall:.1f}s)",
+                      end=" ", flush=True)
+            t0_prop = time.time()
+            # Shared base: propagated alone so its remap uses the full density.
+            # apply_internal_remap=True so it tracks calibration's bucket-by-bucket
+            # remap behavior (the shared base represents the full calibrated density
+            # trajectory; calibration applies remap at every pillar entry).
+            if shared_keys:
+                sb_list = [V_map[k] for k in shared_keys]
+                sb_propagated = propagator.propagate_batch(
+                    sb_list, t_prev, t_event, apply_internal_remap=True)
+                for k, p_new in zip(shared_keys, sb_propagated):
+                    V_map[k] = p_new
+            # Contract slices: propagated together; apply_internal_remap=False
+            # to match the sequential pricer's behavior (which does NOT apply
+            # internal pillar remap during continuous propagation of partial
+            # slices). Re-running Gyöngy on partial-mass slices at internal
+            # pillar crossings would give wrong leverage.
+            if other_keys:
+                cs_list = [V_map[k] for k in other_keys]
+                cs_propagated = propagator.propagate_batch(
+                    cs_list, t_prev, t_event, apply_internal_remap=False)
+                for k, p_new in zip(other_keys, cs_propagated):
+                    V_map[k] = p_new
+            if verbose:
+                print(f"done in {time.time()-t0_prop:.2f}s")
+            t_prev = t_event
+
+        # Precompute z-mapping at this observation time
+        g_now = propagator.get_g_at_time(t_event)
+        z_all = propagator.z_at_Xv(g_now)
+        F = float(fwd(t_event))
+        D = float(disc(t_event))
+
+        # Process each observing group at this event
+        for group_key, k_obs in group_obs_list:
+            # Gather this group's V_cols
+            if not group_observed[group_key]:
+                # First observation for this group: take a copy of shared base
+                if (SHARED_BASE, (0, 0)) not in V_map:
+                    # Shared base was already dropped — shouldn't happen if
+                    # events ordering is correct. Fallback: raise.
+                    raise RuntimeError(
+                        f"Group {group_key} first-observing at t={t_event}, "
+                        f"but shared base has been dropped already.")
+                group_V_cols = {(0, 0): V_map[(SHARED_BASE, (0, 0))].copy()}
+            else:
+                # Collect this group's existing slices
+                group_V_cols = {
+                    (b, m): V_map[(group_key, (b, m))]
+                    for (owner, (b, m)) in list(V_map.keys())
+                    if owner == group_key
+                }
+                # Remove old entries; we'll re-add post-observation
+                for (b, m) in group_V_cols:
+                    del V_map[(group_key, (b, m))]
+
+            # Apply this group's observation
+            group_states = groups[group_key]
+            post = _apply_group_observation(
+                group_states, group_V_cols, k_obs, t_event,
+                group_states[0].spec,  # template (all group members share barriers)
+                z_all, F, D, propagator,
+                M, Nx, N, dX, S0,
+            )
+
+            group_observed[group_key] = True
+
+            # Re-insert this group's post-observation columns
+            for (b, m), u in post.items():
+                V_map[(group_key, (b, m))] = u
+
+        # After all groups at this event are processed, drop shared base
+        # if all groups have observed.
+        all_groups_observed = all(group_observed.values())
+        if all_groups_observed and (SHARED_BASE, (0, 0)) in V_map:
+            del V_map[(SHARED_BASE, (0, 0))]
+            if verbose:
+                print(f"  [shared base dropped] at t={t_event:.4f}")
+
+        # Also drop any group's columns if all its contracts are retired
+        for group_key, members in groups.items():
+            if all(m.retired for m in members):
+                to_drop = [k for k in V_map.keys()
+                           if isinstance(k[0], tuple) and k[0] == group_key]
+                for k in to_drop:
+                    del V_map[k]
+
+        if verbose:
+            n_cols = len(V_map)
+            n_retired = sum(1 for cs in states if cs.retired)
+            print(f"  After obs t={t_event:.4f}: V has {n_cols} columns  "
+                  f"(contracts retired: {n_retired}/{n_contracts})")
+
+    # ── Build PricingResult for each contract ──
+    results: List[PricingResult] = []
+    for cs in states:
+        ap = cs.autocall_probabilities
+        sp = np.zeros(cs.K)
+        sp[:-1] = ap[:-1]
+        # Surviving mass for this contract = 1 - sum of autocall masses. 
+        # This is approximate but matches the old pricer's reporting.
+        surv_mass = max(0.0, 1.0 - float(np.sum(ap)))
+        sp[-1] = surv_mass
+        ts = float(np.sum(sp))
+        ee = float(np.dot(cs.observation_dates, sp) / ts) if ts > 1e-15 else 0.0
+
+        results.append(PricingResult(
+            price=cs.price,
+            notional=cs.spec.notional,
+            price_pct=cs.price / cs.spec.notional * 100,
+            autocall_probabilities=ap,
+            stop_probabilities=sp,
+            coupon_contributions=cs.coupon_contributions,
+            autocall_contributions=cs.autocall_contributions,
+            terminal_par_contribution=cs.terminal_par_contribution,
+            terminal_put_contribution=cs.terminal_put_contribution,
+            survival_probability=surv_mass,
+            ki_probability=0.0,
+            observation_dates=cs.observation_dates,
+            memory_enabled=cs.spec.memory,
+            expected_expiry_years=ee,
+        ))
+
+    if verbose:
+        total_wall = time.time() - t0_wall
+        print(f"\n  Total wall time: {total_wall:.2f}s for {n_contracts} contracts")
+        if n_contracts > 0:
+            print(f"  Avg per contract: {total_wall/n_contracts:.2f}s")
+
+    return results
+
+
+def price_ts_grouped(model, base, mats, cpns, fwd, disc, verbose=True):
+    """Price all (maturity, coupon) pairs via the grouped amortized pricer."""
+    pairs = sorted(zip(mats, cpns))
+    contracts = [
+        AutocallableSpec(**{**base.__dict__,
+                            "maturity_years": T, "coupon_rate": c})
+        for (T, c) in pairs
+    ]
+    results = price_family_grouped(model, contracts, fwd, disc, verbose=verbose)
+    pts = []
+    for (T, c), r, spec in zip(pairs, results, contracts):
+        pd = r.price / spec.notional - 1.0
+        pts.append(TermStructurePoint(
+            T, c, r.price, r.price_pct, pd, 1e4 * pd,
+            r.survival_probability, r.terminal_par_contribution,
+            r.terminal_put_contribution, r.expected_expiry_years, spec.obs_freq,
+        ))
+    return pts
+
+
+
+# ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
 def parse_args():
@@ -1147,10 +2271,30 @@ def parse_args():
     p.add_argument("--leverage_time_stride", type=int, default=1)
     p.add_argument("--dgdt_clip", type=float, default=160.0,
                    help="Clip bound for dg/dt within buckets (match calibrator --clip)")
+    gg = p.add_mutually_exclusive_group()
+    gg.add_argument("--grouped", dest="grouped", action="store_true",
+                    help="Group contracts by barrier structure and share slice "
+                         "trajectories. Default. Much faster when many contracts "
+                         "differ only in maturity / coupon_rate.")
+    gg.add_argument("--no_grouped", dest="grouped", action="store_false",
+                    help="Disable grouping; each contract gets its own slice "
+                         "trajectory. Useful as a reference during validation.")
+    p.set_defaults(grouped=True)
+    pg = p.add_mutually_exclusive_group()
+    pg.add_argument("--f32", dest="use_f32", action="store_true",
+                    help="Run GPU uniformization in float32. ~1.5-2x faster, "
+                         "with ~6-9 bps accumulated pricing drift over 2Y horizon.")
+    pg.add_argument("--f64", dest="use_f32", action="store_false",
+                    help="Run GPU uniformization in float64 (default, full precision).")
+    p.set_defaults(use_f32=False)
     return p.parse_args()
 
 def main():
     args = parse_args(); verbose = not args.quiet
+    # Apply float32 toggle BEFORE anything else
+    set_f32(args.use_f32)
+    if verbose:
+        print(f"GPU precision: {'float32' if args.use_f32 else 'float64'}")
     if verbose: print(f"Loading {args.lsv_result}...")
     model = load_lamperti_model(args.lsv_result, args.leverage_time_stride,
                                  dgdt_clip=args.dgdt_clip)
@@ -1158,11 +2302,11 @@ def main():
         print(f"  S0={model.S0} states={model.n_states} Nx={len(model.X_grid)} Nz={len(model.z_grid)}")
         print(f"  ρ={model.rho:.4f} κ={model.kappa:.4f} θ={model.theta:.6f} ξ={model.xi:.4f}")
         print(f"  Pillars: {list(model.pillar_labels)}")
-    
+
     fT, fF = load_forward_curve(args.forward_curve)
     dT, dD = load_discount_curve(args.discount_curve)
     fi, di = build_interpolators(fT, fF, dT, dD)
-    
+
     base = AutocallableSpec(
         notional=args.notional, maturity_years=args.maturity_years,
         ac_barrier=args.ac_barrier, coupon_barrier=args.coupon_barrier,
@@ -1170,7 +2314,7 @@ def main():
         put_strike=args.put_strike, memory=args.memory,
         obs_freq=normalize_obs_freq(args.obs_freq),
         no_call_periods=args.no_call_periods, ac_step_down=args.ac_step_down)
-    
+
     mats = parse_float_list(args.maturity_years_list, "mats")
     common = parse_float_list(args.coupon_rates_list, "cpn")
     mo = parse_float_list(args.coupon_rates_list_monthly, "mo")
@@ -1178,33 +2322,73 @@ def main():
     sa = parse_float_list(args.coupon_rates_list_semi_annual, "sa")
     an = parse_float_list(args.coupon_rates_list_annual, "an")
     freqs = parse_obs_freq_list(args.obs_freqs_list)
-    
+
+    # AMORTIZED PATH: if multiple (freq, maturity) pairs are specified, build
+    # the full contract family and price it all in ONE forward pass.
     if freqs and mats:
-        curves = {}
+        all_contracts = []
+        contract_meta = []  # (freq, mat, cpn) per contract
         for freq in freqs:
             cl = resolve_cpn(freq, mats, common, mo, qu, sa, an, base.coupon_rate)
-            sf = AutocallableSpec(**{**base.__dict__, "obs_freq": freq})
-            if verbose: print(f"\n{'='*80}\nSWEEP: {freq}\n{'='*80}")
-            curves[freq] = price_ts(model, sf, mats, cl, fi, di, verbose)
+            for T, c in zip(mats, cl):
+                spec = AutocallableSpec(**{
+                    **base.__dict__,
+                    "obs_freq": freq,
+                    "maturity_years": T,
+                    "coupon_rate": c,
+                })
+                all_contracts.append(spec)
+                contract_meta.append((freq, T, c))
+
+        if verbose:
+            print(f"\n{'='*80}")
+            print(f"AMORTIZED FAMILY PRICING: {len(all_contracts)} contracts in one forward pass")
+            print(f"{'='*80}")
+
+        t0_fam = time.time()
+        if args.grouped:
+            results = price_family_grouped(model, all_contracts, fi, di, verbose=verbose)
+        else:
+            results = price_family(model, all_contracts, fi, di, verbose=verbose)
+        total_wall = time.time() - t0_fam
+
+        # Organize into per-freq term structures
+        curves: Dict[str, List[TermStructurePoint]] = {freq: [] for freq in freqs}
+        for spec, r, (freq, T, c) in zip(all_contracts, results, contract_meta):
+            pd = r.price / spec.notional - 1.0
+            curves[freq].append(TermStructurePoint(
+                T, c, r.price, r.price_pct, pd, 1e4 * pd,
+                r.survival_probability, r.terminal_par_contribution,
+                r.terminal_put_contribution, r.expected_expiry_years, freq,
+            ))
+
         all_pts = []
         for f in sorted(curves, key=obs_freq_to_months):
             print_summary(curves[f], f"TERM STRUCTURE — {f}")
             all_pts.extend(curves[f])
+
         save_csv(all_pts, f"{args.output_prefix}.csv")
         if not args.no_plot:
             plot_multi(curves, f"{args.output_prefix}.png")
             plt.close("all")
+
+        print(f"\n{'='*80}")
+        print(f"AMORTIZED TOTAL: {total_wall:.2f}s for {len(all_contracts)} contracts")
+        print(f"  Average: {total_wall/len(all_contracts):.2f}s per contract")
+        print(f"{'='*80}")
         return curves
-    
+
+    # Single-frequency sweep (multiple maturities, one freq)
     if mats:
         cl = resolve_cpn(base.obs_freq, mats, common, mo, qu, sa, an, base.coupon_rate)
-        pts = price_ts(model, base, mats, cl, fi, di, verbose)
+        pts = price_ts_amortized(model, base, mats, cl, fi, di, verbose)
         print_summary(pts)
         return pts
-    
+
     if args.solve_coupon:
         return solve_fair_coupon(model, base, fi, di, verbose)
-    
+
+    # Single contract fallback — use the original single-contract pricer
     return price_autocallable(model, base, fi, di, verbose=verbose)
 
 if __name__ == "__main__":
